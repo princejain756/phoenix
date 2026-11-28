@@ -4,6 +4,7 @@ import logging
 from asyncio import create_task, gather, sleep
 from datetime import datetime, timedelta, timezone
 from time import time
+from typing import Optional
 
 import sqlalchemy as sa
 from sqlalchemy.orm import selectinload
@@ -11,6 +12,7 @@ from sqlalchemy.orm import selectinload
 from phoenix.db.constants import DEFAULT_PROJECT_TRACE_RETENTION_POLICY_ID
 from phoenix.db.helpers import SupportedSQLDialect
 from phoenix.db.models import Project, ProjectSession, ProjectTraceRetentionPolicy, Trace
+from phoenix.db.types.trace_retention import _MaxCount, _MaxDays
 from phoenix.server.dml_event import SpanDeleteEvent
 from phoenix.server.dml_event_handler import DmlEventHandler
 from phoenix.server.prometheus import (
@@ -77,44 +79,122 @@ class TraceDataSweeper(DaemonTask):
             return False
         return True
 
+    async def _project_ids_for_policy(self, policy: ProjectTraceRetentionPolicy) -> list[int]:
+        if policy.id == DEFAULT_PROJECT_TRACE_RETENTION_POLICY_ID:
+            stmt = sa.select(Project.id).where(Project.trace_retention_policy_id.is_(None))
+            async with self._db() as session:
+                return list((await session.scalars(stmt)).all())
+        return [p.id for p in policy.projects]
+
+    async def _max_count_cutoff(
+        self,
+        project_id: int,
+        max_count: int,
+        *,
+        min_start_time: Optional[datetime] = None,
+    ) -> Optional[tuple[datetime, int]]:
+        stmt = (
+            sa.select(Trace.start_time, Trace.id)
+            .where(Trace.project_rowid == project_id)
+            .order_by(Trace.start_time.desc(), Trace.id.desc())
+            .offset(max_count)
+            .limit(1)
+        )
+        if min_start_time is not None:
+            stmt = stmt.where(Trace.start_time >= min_start_time)
+        async with self._db() as session:
+            row = (await session.execute(stmt)).first()
+        return (row[0], row[1]) if row is not None else None
+
+    async def _delete_in_batches(self, deletion_filter: sa.ColumnElement[bool]) -> bool:
+        while self._running:
+            candidate_ids = (
+                sa.select(Trace.id).where(deletion_filter).limit(_TRACE_DELETE_BATCH_SIZE)
+            )
+            if self._db.dialect is SupportedSQLDialect.POSTGRESQL:
+                candidate_ids = candidate_ids.with_for_update(skip_locked=True)
+            stmt = (
+                sa.delete(Trace).where(Trace.id.in_(candidate_ids)).returning(Trace.project_rowid)
+            )
+            async with self._db() as session:
+                deleted_project_rowids = (await session.scalars(stmt)).all()
+            # Publish only committed changes, including batches before a later failure.
+            # RETURNING is bounded by the batch size even for a large backlog.
+            if deleted_project_rowids:
+                self._dml_event_handler.put(
+                    SpanDeleteEvent(tuple(sorted(set(deleted_project_rowids))))
+                )
+            if len(deleted_project_rowids) < _TRACE_DELETE_BATCH_SIZE:
+                return True
+        return False
+
     async def _apply(self, policy: ProjectTraceRetentionPolicy) -> None:
         """Delete matching traces in independently committed batches.
 
-        PostgreSQL skips locked candidates. Batching limits deleted rows,
-        not statement duration.
+        When ``max_count`` is active, each project's ``(start_time, id)`` cutoff
+        is computed once per sweep before batched deletion so large projects do
+        not re-rank all traces on every batch. PostgreSQL skips locked candidates.
         """
         try:
-            project_rowids = (
-                (sa.select(Project.id).where(Project.trace_retention_policy_id.is_(None)))
-                if policy.id == DEFAULT_PROJECT_TRACE_RETENTION_POLICY_ID
-                else [p.id for p in policy.projects]
-            )
-            # For max_count rules the filter's row_number() window is re-evaluated per batch
-            # over all of the policy's traces. The batch limit bounds deletions, not the
-            # ranking work, which can still exceed the statement timeout.
-            deletion_filter = policy.rule.deletion_filter(project_rowids)
-            while self._running:
-                candidate_ids = (
-                    sa.select(Trace.id).where(deletion_filter).limit(_TRACE_DELETE_BATCH_SIZE)
-                )
-                if self._db.dialect is SupportedSQLDialect.POSTGRESQL:
-                    candidate_ids = candidate_ids.with_for_update(skip_locked=True)
-                stmt = (
-                    sa.delete(Trace)
-                    .where(Trace.id.in_(candidate_ids))
-                    .returning(Trace.project_rowid)
-                )
-                async with self._db() as session:
-                    deleted_project_rowids = (await session.scalars(stmt)).all()
-                # Publish only committed changes, including batches before a later failure.
-                # RETURNING is bounded by the batch size even for a large backlog.
-                if deleted_project_rowids:
-                    self._dml_event_handler.put(
-                        SpanDeleteEvent(tuple(sorted(set(deleted_project_rowids))))
+            if not self._running:
+                return
+            rule = policy.rule.root
+            max_days = rule.max_days if isinstance(rule, _MaxDays) else 0.0
+            max_count = rule.max_count if isinstance(rule, _MaxCount) else 0
+            max_days_cutoff = self._now() - timedelta(days=max_days) if max_days > 0 else None
+
+            if max_count <= 0:
+                if max_days_cutoff is not None:
+                    project_rowids = (
+                        sa.select(Project.id).where(Project.trace_retention_policy_id.is_(None))
+                        if policy.id == DEFAULT_PROJECT_TRACE_RETENTION_POLICY_ID
+                        else [p.id for p in policy.projects]
                     )
-                if len(deleted_project_rowids) < _TRACE_DELETE_BATCH_SIZE:
-                    RETENTION_POLICY_EXECUTIONS.labels(status="success").inc()
-                    break
+                    if isinstance(project_rowids, list) and not project_rowids:
+                        RETENTION_POLICY_EXECUTIONS.labels(status="success").inc()
+                        return
+                    deletion_filter = sa.and_(
+                        Trace.project_rowid.in_(project_rowids),
+                        Trace.start_time < max_days_cutoff,
+                    )
+                    if not await self._delete_in_batches(deletion_filter):
+                        return
+            else:
+                project_ids = await self._project_ids_for_policy(policy)
+                for project_id in project_ids:
+                    if not self._running:
+                        return
+                    # Scope the offset lookup to non-expired traces when max_days is also set;
+                    # whenever a cutoff row exists, cutoff_start_time >= max_days_cutoff, so
+                    # traces at or before the cutoff subsume start_time < max_days_cutoff.
+                    cutoff = await self._max_count_cutoff(
+                        project_id,
+                        max_count,
+                        min_start_time=max_days_cutoff,
+                    )
+                    if cutoff is not None:
+                        cutoff_start_time, cutoff_id = cutoff
+                        # Explicit start_time <= cutoff_start_time enables an index range scan on
+                        # ix_traces_project_rowid_start_time while id breaks ties deterministically.
+                        deletion_filter = sa.and_(
+                            Trace.project_rowid == project_id,
+                            Trace.start_time <= cutoff_start_time,
+                            sa.or_(
+                                Trace.start_time < cutoff_start_time,
+                                Trace.id <= cutoff_id,
+                            ),
+                        )
+                    elif max_days_cutoff is not None:
+                        deletion_filter = sa.and_(
+                            Trace.project_rowid == project_id,
+                            Trace.start_time < max_days_cutoff,
+                        )
+                    else:
+                        continue
+                    if not await self._delete_in_batches(deletion_filter):
+                        return
+
+            RETENTION_POLICY_EXECUTIONS.labels(status="success").inc()
         except Exception:
             logger.exception(f"Failed to apply retention policy '{policy.name}' (id={policy.id})")
             RETENTION_POLICY_EXECUTIONS.labels(status="error").inc()

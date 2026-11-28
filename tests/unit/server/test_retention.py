@@ -585,8 +585,16 @@ class TestOrphanSessionSweep:
 class TestRetentionPolicyConcurrentSweep:
     """A replica's retention sweep must not queue behind another replica's in-flight delete."""
 
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            pytest.param(MaxDaysRule(max_days=7), id="max_days"),
+            pytest.param(MaxCountRule(max_count=1), id="max_count"),
+        ],
+    )
     async def test_skips_traces_locked_by_another_replica(
         self,
+        rule: Union[MaxDaysRule, MaxCountRule],
         dialect: str,
         db: DbSessionFactory,
     ) -> None:
@@ -620,7 +628,7 @@ class TestRetentionPolicyConcurrentSweep:
                 DEFAULT_PROJECT_TRACE_RETENTION_POLICY_ID,
             )
             assert policy is not None
-            policy.rule = TraceRetentionRule(root=MaxDaysRule(max_days=max_days))
+            policy.rule = TraceRetentionRule(root=rule)
             policy.cron_expression = TraceRetentionCronExpression(root="0 * * * *")
         locked_trace_id = expired[0].trace_id
 
@@ -930,4 +938,404 @@ class TestRetentionPolicyBatchedDelete:
         assert self._count_executions("success") == num_successes, (
             "a sweep stopped partway through its backlog should not count as a success"
         )
+        assert self._count_executions("error") == num_errors
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            pytest.param(MaxCountRule(max_count=1), id="max_count"),
+            pytest.param(MaxDaysOrCountRule(max_days=7, max_count=2), id="max_days_or_count"),
+        ],
+    )
+    async def test_max_count_does_not_rerank_per_batch(
+        self,
+        rule: Union[MaxCountRule, MaxDaysOrCountRule],
+        db: DbSessionFactory,
+    ) -> None:
+        batch_size = 2
+        max_count = rule.max_count
+        num_excess = 5
+        now = datetime.now(timezone.utc)
+        async with db() as session:
+            project = models.Project(name=token_hex(8))
+            session.add(project)
+            await session.flush()
+            traces = [
+                models.Trace(
+                    project_rowid=project.id,
+                    trace_id=token_hex(16),
+                    start_time=now - timedelta(hours=num_excess + max_count - i),
+                    end_time=now
+                    - timedelta(hours=num_excess + max_count - i)
+                    + timedelta(seconds=1),
+                )
+                for i in range(num_excess + max_count)
+            ]
+            session.add_all(traces)
+            await session.flush()
+            expected_kept_ids = {t.trace_id for t in traces[-max_count:]}
+            policy = models.ProjectTraceRetentionPolicy(
+                name=token_hex(8),
+                rule=TraceRetentionRule(root=rule),
+                cron_expression=TraceRetentionCronExpression(root="0 * * * *"),
+                projects=[project],
+            )
+            session.add(policy)
+
+        dml_event_handler = MagicMock()
+        sweeper = TraceDataSweeper(db=db, dml_event_handler=dml_event_handler)
+        sweeper._running = True
+        loaded_policy = await self._get_policy(sweeper, policy.name)
+
+        delete_statements: list[str] = []
+        offset_selects: list[str] = []
+
+        def record_sql(
+            conn: Any,
+            cursor: Any,
+            statement: str,
+            parameters: Any,
+            context: Any,
+            executemany: bool,
+        ) -> None:
+            low = statement.lower()
+            if "delete from traces" in low:
+                delete_statements.append(low)
+            elif "from traces" in low and "offset" in low:
+                offset_selects.append(low)
+
+        sa.event.listen(sa.engine.Engine, "before_cursor_execute", record_sql)
+        try:
+            with patch(
+                "phoenix.server.retention._TRACE_DELETE_BATCH_SIZE", batch_size, create=True
+            ):
+                await sweeper._apply(loaded_policy)
+        finally:
+            sa.event.remove(sa.engine.Engine, "before_cursor_execute", record_sql)
+
+        assert await self._list_trace_ids(db, project.id) == expected_kept_ids
+        assert len(delete_statements) >= ceil(num_excess / batch_size)
+        assert not any("row_number" in stmt or "over (" in stmt for stmt in delete_statements)
+        assert len(offset_selects) == 1
+        assert dml_event_handler.put.call_args_list == [
+            call(SpanDeleteEvent((project.id,)))
+        ] * ceil(num_excess / batch_size)
+
+    async def test_max_count_breaks_start_time_ties_deterministically_by_id(
+        self,
+        db: DbSessionFactory,
+    ) -> None:
+        batch_size = 2
+        max_count = 2
+        total_traces = 6
+        tied_start_time = datetime.now(timezone.utc) - timedelta(hours=1)
+        async with db() as session:
+            project = models.Project(name=token_hex(8))
+            session.add(project)
+            await session.flush()
+            traces = [
+                models.Trace(
+                    project_rowid=project.id,
+                    trace_id=token_hex(16),
+                    start_time=tied_start_time,
+                    end_time=tied_start_time + timedelta(seconds=1),
+                )
+                for _ in range(total_traces)
+            ]
+            session.add_all(traces)
+            await session.flush()
+            traces_by_id = sorted(traces, key=lambda t: t.id)
+            expected_kept_ids = {t.trace_id for t in traces_by_id[-max_count:]}
+            policy = models.ProjectTraceRetentionPolicy(
+                name=token_hex(8),
+                rule=TraceRetentionRule(root=MaxCountRule(max_count=max_count)),
+                cron_expression=TraceRetentionCronExpression(root="0 * * * *"),
+                projects=[project],
+            )
+            session.add(policy)
+
+        dml_event_handler = MagicMock()
+        sweeper = TraceDataSweeper(db=db, dml_event_handler=dml_event_handler)
+        sweeper._running = True
+        loaded_policy = await self._get_policy(sweeper, policy.name)
+
+        with patch("phoenix.server.retention._TRACE_DELETE_BATCH_SIZE", batch_size, create=True):
+            await sweeper._apply(loaded_policy)
+
+        assert await self._list_trace_ids(db, project.id) == expected_kept_ids
+        assert dml_event_handler.put.call_args_list == [
+            call(SpanDeleteEvent((project.id,)))
+        ] * ceil((total_traces - max_count) / batch_size)
+
+    @pytest.mark.parametrize("use_default_policy", [True, False])
+    async def test_max_count_isolates_projects_and_skips_under_limit_projects(
+        self,
+        use_default_policy: bool,
+        db: DbSessionFactory,
+    ) -> None:
+        batch_size = 2
+        max_count = 2
+        now = datetime.now(timezone.utc)
+        async with db() as session:
+            project_a = models.Project(name=token_hex(8))
+            project_b = models.Project(name=token_hex(8))
+            project_c = models.Project(name=token_hex(8))
+            project_other = models.Project(name=token_hex(8))
+            session.add_all([project_a, project_b, project_c, project_other])
+            await session.flush()
+
+            def make_traces(project_id: int, count: int) -> list[models.Trace]:
+                return [
+                    models.Trace(
+                        project_rowid=project_id,
+                        trace_id=token_hex(16),
+                        start_time=now - timedelta(hours=count - i),
+                        end_time=now - timedelta(hours=count - i) + timedelta(seconds=1),
+                    )
+                    for i in range(count)
+                ]
+
+            traces_a = make_traces(project_a.id, 6)
+            traces_b = make_traces(project_b.id, 2)
+            traces_c = make_traces(project_c.id, 5)
+            traces_other = make_traces(project_other.id, 6)
+            session.add_all([*traces_a, *traces_b, *traces_c, *traces_other])
+            await session.flush()
+
+            other_policy = models.ProjectTraceRetentionPolicy(
+                name=token_hex(8),
+                rule=TraceRetentionRule(root=MaxCountRule(max_count=100)),
+                cron_expression=TraceRetentionCronExpression(root="0 * * * *"),
+                projects=[project_other],
+            )
+            session.add(other_policy)
+
+            if use_default_policy:
+                target_policy = await session.get(
+                    models.ProjectTraceRetentionPolicy,
+                    DEFAULT_PROJECT_TRACE_RETENTION_POLICY_ID,
+                )
+                assert target_policy is not None
+                target_policy.rule = TraceRetentionRule(root=MaxCountRule(max_count=max_count))
+                target_policy.cron_expression = TraceRetentionCronExpression(root="0 * * * *")
+            else:
+                target_policy = models.ProjectTraceRetentionPolicy(
+                    name=token_hex(8),
+                    rule=TraceRetentionRule(root=MaxCountRule(max_count=max_count)),
+                    cron_expression=TraceRetentionCronExpression(root="0 * * * *"),
+                    projects=[project_a, project_b, project_c],
+                )
+                session.add(target_policy)
+
+        dml_event_handler = MagicMock()
+        sweeper = TraceDataSweeper(db=db, dml_event_handler=dml_event_handler)
+        sweeper._running = True
+        loaded_policy = await self._get_policy(sweeper, target_policy.name)
+
+        delete_statements: list[str] = []
+
+        def record_delete(
+            conn: Any,
+            cursor: Any,
+            statement: str,
+            parameters: Any,
+            context: Any,
+            executemany: bool,
+        ) -> None:
+            low = statement.lower()
+            if "delete from traces" in low:
+                delete_statements.append(low)
+
+        sa.event.listen(sa.engine.Engine, "before_cursor_execute", record_delete)
+        try:
+            with patch(
+                "phoenix.server.retention._TRACE_DELETE_BATCH_SIZE", batch_size, create=True
+            ):
+                await sweeper._apply(loaded_policy)
+        finally:
+            sa.event.remove(sa.engine.Engine, "before_cursor_execute", record_delete)
+
+        assert await self._list_trace_ids(db, project_a.id) == {
+            t.trace_id for t in traces_a[-max_count:]
+        }
+        assert await self._list_trace_ids(db, project_b.id) == {t.trace_id for t in traces_b}
+        assert await self._list_trace_ids(db, project_c.id) == {
+            t.trace_id for t in traces_c[-max_count:]
+        }
+        assert await self._list_trace_ids(db, project_other.id) == {
+            t.trace_id for t in traces_other
+        }
+        # Project A deletes 4 rows in 2 batches (+ 1 final check), Project C deletes 3 rows in 2 batches,
+        # and Project B has no cutoff row so it issues zero DELETE statements.
+        published_projects = [c.args[0].ids for c in dml_event_handler.put.call_args_list]
+        assert (project_b.id,) not in published_projects
+        assert (project_other.id,) not in published_projects
+        assert published_projects.count((project_a.id,)) == 2
+        assert published_projects.count((project_c.id,)) == 2
+
+    async def test_max_days_or_count_combines_both_branches_across_projects(
+        self,
+        db: DbSessionFactory,
+    ) -> None:
+        batch_size = 2
+        max_days = 7
+        max_count = 2
+        now = datetime.now(timezone.utc)
+        async with db() as session:
+            p_days_dominates = models.Project(name=token_hex(8))
+            p_count_dominates = models.Project(name=token_hex(8))
+            p_all_expired = models.Project(name=token_hex(8))
+            session.add_all([p_days_dominates, p_count_dominates, p_all_expired])
+            await session.flush()
+
+            def add_traces(project_id: int, recent_count: int, old_count: int) -> set[str]:
+                recent = [
+                    models.Trace(
+                        project_rowid=project_id,
+                        trace_id=token_hex(16),
+                        start_time=now - timedelta(hours=recent_count - i),
+                        end_time=now - timedelta(hours=recent_count - i) + timedelta(seconds=1),
+                    )
+                    for i in range(recent_count)
+                ]
+                old = [
+                    models.Trace(
+                        project_rowid=project_id,
+                        trace_id=token_hex(16),
+                        start_time=now - timedelta(days=max_days + 2 + i),
+                        end_time=now - timedelta(days=max_days + 2 + i) + timedelta(seconds=1),
+                    )
+                    for i in range(old_count)
+                ]
+                session.add_all([*recent, *old])
+                return {t.trace_id for t in recent[-max_count:]}
+
+            expected_p1 = add_traces(p_days_dominates.id, recent_count=1, old_count=3)
+            expected_p2 = add_traces(p_count_dominates.id, recent_count=4, old_count=3)
+            expected_p3 = add_traces(p_all_expired.id, recent_count=0, old_count=4)
+            policy = models.ProjectTraceRetentionPolicy(
+                name=token_hex(8),
+                rule=TraceRetentionRule(
+                    root=MaxDaysOrCountRule(max_days=max_days, max_count=max_count)
+                ),
+                cron_expression=TraceRetentionCronExpression(root="0 * * * *"),
+                projects=[p_days_dominates, p_count_dominates, p_all_expired],
+            )
+            session.add(policy)
+
+        dml_event_handler = MagicMock()
+        sweeper = TraceDataSweeper(db=db, dml_event_handler=dml_event_handler)
+        sweeper._running = True
+        loaded_policy = await self._get_policy(sweeper, policy.name)
+
+        deletes_per_statement: list[int] = []
+        before_counts: list[int] = []
+
+        def count_traces(conn: Any) -> int:
+            return int(conn.exec_driver_sql("SELECT count(*) FROM traces").scalar_one())
+
+        def before_delete(
+            conn: Any,
+            cursor: Any,
+            statement: str,
+            parameters: Any,
+            context: Any,
+            executemany: bool,
+        ) -> None:
+            if "DELETE FROM traces" in statement:
+                before_counts.append(count_traces(conn))
+
+        def after_delete(
+            conn: Any,
+            cursor: Any,
+            statement: str,
+            parameters: Any,
+            context: Any,
+            executemany: bool,
+        ) -> None:
+            if "DELETE FROM traces" in statement:
+                deletes_per_statement.append(before_counts.pop() - count_traces(conn))
+
+        sa.event.listen(sa.engine.Engine, "before_cursor_execute", before_delete)
+        sa.event.listen(sa.engine.Engine, "after_cursor_execute", after_delete)
+        try:
+            with patch(
+                "phoenix.server.retention._TRACE_DELETE_BATCH_SIZE", batch_size, create=True
+            ):
+                await sweeper._apply(loaded_policy)
+        finally:
+            sa.event.remove(sa.engine.Engine, "before_cursor_execute", before_delete)
+            sa.event.remove(sa.engine.Engine, "after_cursor_execute", after_delete)
+
+        assert await self._list_trace_ids(db, p_days_dominates.id) == expected_p1
+        assert await self._list_trace_ids(db, p_count_dominates.id) == expected_p2
+        assert await self._list_trace_ids(db, p_all_expired.id) == expected_p3
+        assert sum(deletes_per_statement) == 3 + 5 + 4
+        assert max(deletes_per_statement) <= batch_size
+
+    async def test_max_count_stops_between_projects_without_recording_success(
+        self,
+        db: DbSessionFactory,
+    ) -> None:
+        batch_size = 2
+        max_count = 1
+        now = datetime.now(timezone.utc)
+        async with db() as session:
+            p1 = models.Project(name=token_hex(8))
+            p2 = models.Project(name=token_hex(8))
+            session.add_all([p1, p2])
+            await session.flush()
+            for proj in (p1, p2):
+                session.add_all(
+                    [
+                        models.Trace(
+                            project_rowid=proj.id,
+                            trace_id=token_hex(16),
+                            start_time=now - timedelta(hours=4 - i),
+                            end_time=now - timedelta(hours=4 - i) + timedelta(seconds=1),
+                        )
+                        for i in range(4)
+                    ]
+                )
+            policy = models.ProjectTraceRetentionPolicy(
+                name=token_hex(8),
+                rule=TraceRetentionRule(root=MaxCountRule(max_count=max_count)),
+                cron_expression=TraceRetentionCronExpression(root="0 * * * *"),
+                projects=[p1, p2],
+            )
+            session.add(policy)
+
+        dml_event_handler = MagicMock()
+        sweeper = TraceDataSweeper(db=db, dml_event_handler=dml_event_handler)
+        sweeper._running = True
+        loaded_policy = await self._get_policy(sweeper, policy.name)
+
+        def stop_after_first_delete(
+            conn: Any,
+            cursor: Any,
+            statement: str,
+            parameters: Any,
+            context: Any,
+            executemany: bool,
+        ) -> None:
+            if "DELETE FROM traces" in statement:
+                sweeper._running = False
+
+        num_successes = self._count_executions("success")
+        num_errors = self._count_executions("error")
+        sa.event.listen(sa.engine.Engine, "after_cursor_execute", stop_after_first_delete)
+        try:
+            with patch(
+                "phoenix.server.retention._TRACE_DELETE_BATCH_SIZE", batch_size, create=True
+            ):
+                await sweeper._apply(loaded_policy)
+        finally:
+            sa.event.remove(sa.engine.Engine, "after_cursor_execute", stop_after_first_delete)
+
+        remaining_total = len(await self._list_trace_ids(db, p1.id)) + len(
+            await self._list_trace_ids(db, p2.id)
+        )
+        assert remaining_total == 8 - batch_size
+        dml_event_handler.put.assert_called_once()
+        assert self._count_executions("success") == num_successes
         assert self._count_executions("error") == num_errors
